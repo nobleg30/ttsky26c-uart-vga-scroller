@@ -1,40 +1,107 @@
-# SPDX-FileCopyrightText: © 2024 Tiny Tapeout
 # SPDX-License-Identifier: Apache-2.0
 
+import os
 import cocotb
 from cocotb.clock import Clock
 from cocotb.triggers import ClockCycles
 
+CLK_PERIOD_NS = 1e9 / 25_175_000
+UART_CLKS_PER_BIT = round(25_175_000 / 9600)
 
-@cocotb.test()
-async def test_project(dut):
-    dut._log.info("Start")
 
-    # Set the clock period to 10 us (100 KHz)
-    clock = Clock(dut.clk, 10, unit="us")
-    cocotb.start_soon(clock.start())
+def set_rx(dut, bit):
+    value = int(dut.ui_in.value)
+    if bit:
+        value |= (1 << 3)
+    else:
+        value &= ~(1 << 3)
+    dut.ui_in.value = value
 
-    # Reset
-    dut._log.info("Reset")
+
+async def reset_dut(dut):
     dut.ena.value = 1
-    dut.ui_in.value = 0
     dut.uio_in.value = 0
+
+    # UART idle high. Speed = 00. Pause = 0.
+    dut.ui_in.value = 0x08
+
     dut.rst_n.value = 0
     await ClockCycles(dut.clk, 10)
     dut.rst_n.value = 1
+    await ClockCycles(dut.clk, 2)
 
-    dut._log.info("Test project behavior")
 
-    # Set the input values you want to test
-    dut.ui_in.value = 20
-    dut.uio_in.value = 30
+async def uart_send_byte(dut, value):
+    # Start bit
+    set_rx(dut, 0)
+    await ClockCycles(dut.clk, UART_CLKS_PER_BIT)
 
-    # Wait for one clock cycle to see the output values
-    await ClockCycles(dut.clk, 1)
+    # 8 data bits, LSB first
+    for bit_index in range(8):
+        set_rx(dut, (value >> bit_index) & 1)
+        await ClockCycles(dut.clk, UART_CLKS_PER_BIT)
 
-    # The following assersion is just an example of how to check the output values.
-    # Change it to match the actual expected output of your module:
-    assert dut.uo_out.value == 50
+    # Stop bit
+    set_rx(dut, 1)
+    await ClockCycles(dut.clk, UART_CLKS_PER_BIT)
 
-    # Keep testing the module by changing the input values, waiting for
-    # one or more clock cycles, and asserting the expected output values.
+    # Small idle gap
+    await ClockCycles(dut.clk, 4)
+
+
+@cocotb.test()
+async def test_uart_vga_scroller(dut):
+    clock = Clock(dut.clk, CLK_PERIOD_NS, unit="ns")
+    cocotb.start_soon(clock.start())
+
+    # ------------------------------------------------------------
+    # Basic reset, unused-I/O and VGA HSYNC test
+    # ------------------------------------------------------------
+    await reset_dut(dut)
+
+    assert int(dut.uio_out.value) == 0
+    assert int(dut.uio_oe.value) == 0
+
+    # h_count is 2 here. At x=0..655 HSYNC is high.
+    assert ((int(dut.uo_out.value) >> 7) & 1) == 1
+
+    # Advance from x=2 to x=656.
+    await ClockCycles(dut.clk, 654)
+    assert ((int(dut.uo_out.value) >> 7) & 1) == 0, \
+        "HSYNC should be low at x=656"
+
+    # HSYNC is low for x=656..751 (96 clocks).
+    await ClockCycles(dut.clk, 96)
+    assert ((int(dut.uo_out.value) >> 7) & 1) == 1, \
+        "HSYNC should return high at x=752"
+
+    # Gate-level netlist does not expose RTL internal registers.
+    if os.getenv("GATES", "no") == "yes":
+        return
+
+    # ------------------------------------------------------------
+    # UART/message-buffer test
+    # ------------------------------------------------------------
+    await reset_dut(dut)
+
+    for ch in b"HELLO":
+        await uart_send_byte(dut, ch)
+
+    await ClockCycles(dut.clk, 4)
+
+    assert int(dut.user_project.msg_len.value) == 5
+    assert int(dut.user_project.write_ptr.value) == 5
+
+    # Enter restarts scrolling and prepares the buffer for a new message.
+    await uart_send_byte(dut, 0x0D)
+    await ClockCycles(dut.clk, 4)
+
+    assert int(dut.user_project.msg_len.value) == 5
+    assert int(dut.user_project.write_ptr.value) == 0
+
+    # The next character starts a new message at position zero.
+    await uart_send_byte(dut, ord("A"))
+    await ClockCycles(dut.clk, 4)
+
+    assert int(dut.user_project.msg_len.value) == 1
+    assert int(dut.user_project.write_ptr.value) == 1
