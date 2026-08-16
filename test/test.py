@@ -5,7 +5,7 @@ import cocotb
 from cocotb.clock import Clock
 from cocotb.triggers import ClockCycles
 
-CLK_PERIOD_NS = 1e9 / 25_175_000
+CLK_PERIOD_PS = 39722
 UART_CLKS_PER_BIT = round(25_175_000 / 9600)
 
 
@@ -51,7 +51,7 @@ async def uart_send_byte(dut, value):
 
 @cocotb.test()
 async def test_uart_vga_scroller(dut):
-    clock = Clock(dut.clk, CLK_PERIOD_NS, unit="ns")
+    clock = Clock(dut.clk, CLK_PERIOD_PS, unit="ps")
     cocotb.start_soon(clock.start())
 
     # ------------------------------------------------------------
