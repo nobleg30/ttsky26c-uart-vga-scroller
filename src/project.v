@@ -941,7 +941,7 @@ endmodule
 // 25.175 MHz / 9600 = approximately 2622 clocks/bit
 //
 // Fixed constants are intentionally width-matched to clk_count to avoid
-// Verilator WIDTHEXPAND warnings.
+// Width-matched constants avoid width-expansion lint warnings
 // ============================================================================
 
 module uart_rx (
