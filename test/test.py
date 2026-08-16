@@ -3,7 +3,7 @@
 import os
 import cocotb
 from cocotb.clock import Clock
-from cocotb.triggers import ClockCycles
+from cocotb.triggers import ClockCycles, Timer
 
 CLK_PERIOD_PS = 39722
 UART_CLKS_PER_BIT = round(25_175_000 / 9600)
@@ -65,15 +65,21 @@ async def test_uart_vga_scroller(dut):
     # h_count is 2 here. At x=0..655 HSYNC is high.
     assert ((int(dut.uo_out.value) >> 7) & 1) == 1
 
-    # Advance from x=2 to x=656.
     await ClockCycles(dut.clk, 654)
-    assert ((int(dut.uo_out.value) >> 7) & 1) == 0, \
-        "HSYNC should be low at x=656"
 
-    # HSYNC is low for x=656..751 (96 clocks).
+    # Allow gate-level combinational propagation to settle.
+    await Timer(10, unit="ns")
+
+    assert ((int(dut.uo_out.value) >> 7) & 1) == 0, \
+    "HSYNC should be low at x=656"
+
     await ClockCycles(dut.clk, 96)
+
+    # Allow gate-level combinational propagation to settle.
+    await Timer(10, unit="ns")
+
     assert ((int(dut.uo_out.value) >> 7) & 1) == 1, \
-        "HSYNC should return high at x=752"
+    "HSYNC should return high at x=752"
 
     # Gate-level netlist does not expose RTL internal registers.
     if os.getenv("GATES", "no") == "yes":
