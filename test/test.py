@@ -1,25 +1,26 @@
 # SPDX-License-Identifier: Apache-2.0
 #
-# Functional verification for:
-# tt_um_nobleg30_uart_vga_scroller
+# Cocotb verification for the 4x-scaled, colour-selectable version of:
+#   tt_um_nobleg30_uart_vga_scroller
 #
-# This test:
-#   1. Checks reset and unused UIO pins.
-#   2. Checks VGA HSYNC timing.
-#   3. Runs the external-pin check in gate-level simulation.
-#   4. Sends "HELLO MITS" through the actual UART RX input in RTL simulation.
-#   5. Checks message length, Enter handling, scroll speed, and pause.
-#   6. Verifies the VGA pixels against an independent golden 5x7 font model.
-#   7. Generates two 640x480 PNG frames:
+# ui_in mapping:
+#   [1:0] scroll speed
+#   [2]   pause
+#   [3]   UART RX
+#   [5:4] text colour:
+#           00 white
+#           01 yellow
+#           10 cyan
+#           11 magenta
+#   [7:6] background colour:
+#           00 black
+#           01 dark blue
+#           10 dark green
+#           11 dark red
 #
-#        output/vga_hello_mits_frame1.png
-#        output/vga_hello_mits_frame2.png
-#
-#      Frame 1: message left edge at x = 200
-#      Frame 2: message left edge at x = 120
-#
-# The image-generation portion is RTL-only because it intentionally accesses
-# internal RTL state to place the message at convenient visible locations.
+# Verifies an exact 32-character UART message and generates:
+#   output/vga_32char_white_black_start.png
+#   output/vga_32char_yellow_blue_end.png
 
 import os
 import struct
@@ -31,65 +32,67 @@ from cocotb.clock import Clock
 from cocotb.triggers import ClockCycles, ReadOnly, RisingEdge, Timer
 
 
-# ============================================================================
-# CLOCK / UART SETTINGS
-# ============================================================================
-
-# Integer picoseconds avoid Icarus precision errors.
-# 39.722 ns is approximately 25.175 MHz.
 CLK_PERIOD_PS = 39722
-
-# Must match the clean RTL UART receiver.
 UART_CLKS_PER_BIT = 2622
 
 
 # ============================================================================
-# INPUT CONTROL HELPERS
+# INPUT HELPERS
 # ============================================================================
 
+def make_ui(
+    speed=0,
+    pause=False,
+    rx=1,
+    text_color=0,
+    bg_color=0,
+):
+    value = speed & 0x3
+
+    if pause:
+        value |= 1 << 2
+
+    if rx:
+        value |= 1 << 3
+
+    value |= (text_color & 0x3) << 4
+    value |= (bg_color & 0x3) << 6
+
+    return value
+
+
+def set_controls(
+    dut,
+    speed=0,
+    pause=False,
+    text_color=0,
+    bg_color=0,
+):
+    dut.ui_in.value = make_ui(
+        speed=speed,
+        pause=pause,
+        rx=1,
+        text_color=text_color,
+        bg_color=bg_color,
+    )
+
+
 def set_rx(dut, bit):
-    """
-    Drive UART RX on ui_in[3] without changing the other ui_in bits.
-    """
     value = int(dut.ui_in.value)
 
     if bit:
-        value |= (1 << 3)
+        value |= 1 << 3
     else:
         value &= ~(1 << 3)
 
     dut.ui_in.value = value
 
 
-def set_controls(dut, speed=0, pause=False):
-    """
-    ui_in[1:0] = scroll speed
-    ui_in[2]   = pause
-    ui_in[3]   = UART RX, idle high
-    """
-    value = speed & 0x3
-
-    if pause:
-        value |= (1 << 2)
-
-    # UART idle state is logic 1.
-    value |= (1 << 3)
-
-    dut.ui_in.value = value
-
-
 async def reset_dut(dut):
-    """
-    Reset DUT while holding UART RX in idle-high state.
-    """
     dut.ena.value = 1
     dut.uio_in.value = 0
 
-    set_controls(
-        dut,
-        speed=0,
-        pause=False,
-    )
+    set_controls(dut)
 
     dut.rst_n.value = 0
     await ClockCycles(dut.clk, 10)
@@ -99,86 +102,36 @@ async def reset_dut(dut):
 
 
 # ============================================================================
-# UART TRANSMISSION HELPERS
+# UART
 # ============================================================================
 
 async def uart_send_byte(dut, value):
-    """
-    Send one byte as UART 9600-baud 8-N-1.
-
-    Transmission order:
-        start bit
-        bit 0
-        bit 1
-        ...
-        bit 7
-        stop bit
-    """
-
-    # Start bit
     set_rx(dut, 0)
-    await ClockCycles(
-        dut.clk,
-        UART_CLKS_PER_BIT,
-    )
+    await ClockCycles(dut.clk, UART_CLKS_PER_BIT)
 
-    # 8 data bits, LSB first
     for bit_index in range(8):
+        set_rx(dut, (value >> bit_index) & 1)
+        await ClockCycles(dut.clk, UART_CLKS_PER_BIT)
 
-        set_rx(
-            dut,
-            (value >> bit_index) & 1,
-        )
-
-        await ClockCycles(
-            dut.clk,
-            UART_CLKS_PER_BIT,
-        )
-
-    # Stop bit
     set_rx(dut, 1)
+    await ClockCycles(dut.clk, UART_CLKS_PER_BIT)
 
-    await ClockCycles(
-        dut.clk,
-        UART_CLKS_PER_BIT,
-    )
-
-    # Small idle gap
-    await ClockCycles(
-        dut.clk,
-        4,
-    )
+    await ClockCycles(dut.clk, 4)
 
 
 async def uart_send_message(dut, text):
-    """
-    Send an ASCII message followed by carriage return.
-    """
+    for value in text.encode("ascii"):
+        await uart_send_byte(dut, value)
 
-    for byte_value in text.encode("ascii"):
-
-        await uart_send_byte(
-            dut,
-            byte_value,
-        )
-
-    # Enter / carriage return
-    await uart_send_byte(
-        dut,
-        0x0D,
-    )
+    await uart_send_byte(dut, 0x0D)
 
 
 # ============================================================================
-# MINIMAL PNG WRITER
-#
-# No Pillow dependency is required.
+# PNG WRITER
 # ============================================================================
 
 def png_chunk(chunk_type, data):
-
     payload = chunk_type + data
-
     crc = zlib.crc32(payload) & 0xFFFFFFFF
 
     return (
@@ -189,79 +142,41 @@ def png_chunk(chunk_type, data):
 
 
 def write_png(filename, width, height, pixels):
-    """
-    Write RGB888 PNG.
-
-    pixels:
-        flat list of (R,G,B) tuples in row-major order.
-    """
-
     raw = bytearray()
 
     for y in range(height):
-
-        # PNG filter type 0
         raw.append(0)
 
-        row_start = y * width
-        row_end = row_start + width
+        start = y * width
+        end = start + width
 
-        for red, green, blue in pixels[row_start:row_end]:
-
-            raw.extend(
-                (
-                    red,
-                    green,
-                    blue,
-                )
-            )
+        for red, green, blue in pixels[start:end]:
+            raw.extend((red, green, blue))
 
     ihdr = struct.pack(
         ">IIBBBBB",
         width,
         height,
-        8,    # 8 bits/channel
-        2,    # RGB truecolour
+        8,
+        2,
         0,
         0,
         0,
     )
 
-    png_data = bytearray(
-        b"\x89PNG\r\n\x1a\n"
-    )
+    data = bytearray(b"\x89PNG\r\n\x1a\n")
+    data += png_chunk(b"IHDR", ihdr)
+    data += png_chunk(b"IDAT", zlib.compress(bytes(raw), level=9))
+    data += png_chunk(b"IEND", b"")
 
-    png_data += png_chunk(
-        b"IHDR",
-        ihdr,
-    )
-
-    png_data += png_chunk(
-        b"IDAT",
-        zlib.compress(
-            bytes(raw),
-            level=9,
-        ),
-    )
-
-    png_data += png_chunk(
-        b"IEND",
-        b"",
-    )
-
-    Path(filename).write_bytes(
-        png_data
-    )
+    Path(filename).write_bytes(data)
 
 
 # ============================================================================
-# INDEPENDENT GOLDEN 5x7 FONT
-#
-# Only the characters required for "HELLO MITS" are included here.
+# GOLDEN FONT
 # ============================================================================
 
 FONT = {
-
     " ": [
         "00000",
         "00000",
@@ -271,7 +186,6 @@ FONT = {
         "00000",
         "00000",
     ],
-
     "H": [
         "10001",
         "10001",
@@ -281,7 +195,6 @@ FONT = {
         "10001",
         "10001",
     ],
-
     "E": [
         "11111",
         "10000",
@@ -291,7 +204,6 @@ FONT = {
         "10000",
         "11111",
     ],
-
     "L": [
         "10000",
         "10000",
@@ -301,7 +213,6 @@ FONT = {
         "10000",
         "11111",
     ],
-
     "O": [
         "01110",
         "10001",
@@ -311,7 +222,6 @@ FONT = {
         "10001",
         "01110",
     ],
-
     "M": [
         "10001",
         "11011",
@@ -321,7 +231,6 @@ FONT = {
         "10001",
         "10001",
     ],
-
     "I": [
         "11111",
         "00100",
@@ -331,7 +240,6 @@ FONT = {
         "00100",
         "11111",
     ],
-
     "T": [
         "11111",
         "00100",
@@ -341,7 +249,6 @@ FONT = {
         "00100",
         "00100",
     ],
-
     "S": [
         "01111",
         "10000",
@@ -355,77 +262,89 @@ FONT = {
 
 
 # ============================================================================
-# GOLDEN PIXEL MODEL
+# COLOUR MODELS
 # ============================================================================
 
-def expected_text_pixel(
+TEXT_RGB222 = {
+    0: (3, 3, 3),  # white
+    1: (3, 3, 0),  # yellow
+    2: (0, 3, 3),  # cyan
+    3: (3, 0, 3),  # magenta
+}
+
+BG_RGB222 = {
+    0: (0, 0, 0),  # black
+    1: (0, 0, 1),  # dark blue
+    2: (0, 1, 0),  # dark green
+    3: (1, 0, 0),  # dark red
+}
+
+
+def rgb222_to_rgb888(rgb):
+    return tuple(channel * 85 for channel in rgb)
+
+
+def decode_rgb222(uo_value):
+    red = (
+        (((uo_value >> 0) & 1) << 1)
+        | ((uo_value >> 4) & 1)
+    )
+
+    green = (
+        (((uo_value >> 1) & 1) << 1)
+        | ((uo_value >> 5) & 1)
+    )
+
+    blue = (
+        (((uo_value >> 2) & 1) << 1)
+        | ((uo_value >> 6) & 1)
+    )
+
+    return (red, green, blue)
+
+
+# ============================================================================
+# 4x GOLDEN PIXEL MODEL
+# ============================================================================
+
+def expected_text_on(
     message,
     x,
     y,
     left_x,
-    top_y=232,
+    top_y=224,
 ):
-    """
-    Golden model of the RTL text renderer.
-
-    Character cell:
-        16 x 16 pixels
-
-    Font:
-        5 x 7
-
-    Scale:
-        2 x
-
-    Therefore:
-        visible glyph width  = 10 pixels
-        visible glyph height = 14 pixels
-
-    The RTL uses glyph columns 1..5 of the 8-column-scaled character cell.
-    """
-
-    # Outside text cell vertically
-    if y < top_y:
+    # 32x32 character cells.
+    if y < top_y or y >= top_y + 32:
         return False
 
-    if y >= top_y + 16:
-        return False
-
-    # Outside complete message horizontally
     if x < left_x:
         return False
 
-    if x >= left_x + (16 * len(message)):
+    if x >= left_x + 32 * len(message):
         return False
 
     rel_x = x - left_x
     rel_y = y - top_y
 
-    char_index = rel_x // 16
+    char_index = rel_x // 32
 
     if char_index >= len(message):
         return False
 
-    character = message[char_index]
+    glyph_col = (rel_x % 32) // 4
+    glyph_row = rel_y // 4
 
-    glyph_col = (
-        (rel_x % 16) // 2
-    )
-
-    glyph_row = (
-        rel_y // 2
-    )
-
-    # RTL uses columns 1 through 5.
-    if glyph_col < 1:
-        return False
-
-    if glyph_col > 5:
+    # Same cell layout as the RTL:
+    # glyph columns 1..5 contain the 5 font columns.
+    if glyph_col < 1 or glyph_col > 5:
         return False
 
     # Row 7 is blank.
     if glyph_row > 6:
         return False
+
+    character = message[char_index]
 
     return (
         FONT[character][glyph_row][glyph_col - 1]
@@ -434,164 +353,93 @@ def expected_text_pixel(
 
 
 # ============================================================================
-# TinyVGA RGB222 DECODER
+# FRAME CAPTURE / VERIFICATION
 # ============================================================================
 
-def decode_rgb222(uo_value):
-    """
-    RTL pin mapping:
-
-        uo[0] = R1
-        uo[4] = R0
-
-        uo[1] = G1
-        uo[5] = G0
-
-        uo[2] = B1
-        uo[6] = B0
-
-    Converts each 2-bit channel (0..3) to 8-bit (0..255).
-    """
-
-    red_2bit = (
-        (((uo_value >> 0) & 1) << 1)
-        |
-        ((uo_value >> 4) & 1)
-    )
-
-    green_2bit = (
-        (((uo_value >> 1) & 1) << 1)
-        |
-        ((uo_value >> 5) & 1)
-    )
-
-    blue_2bit = (
-        (((uo_value >> 2) & 1) << 1)
-        |
-        ((uo_value >> 6) & 1)
-    )
-
-    return (
-        red_2bit * 85,
-        green_2bit * 85,
-        blue_2bit * 85,
-    )
-
-
-# ============================================================================
-# RENDER AND VERIFY ONE VGA FRAME
-# ============================================================================
-
-async def render_and_verify_frame(
+async def capture_frame(
     dut,
     message,
     left_x,
+    text_color,
+    bg_color,
     image_path,
 ):
-    """
-    Force a convenient scrolling position, sample the actual RGB outputs,
-    compare every sampled text-region pixel against the independent golden
-    font model, and write a complete 640x480 PNG.
-    """
-
     width = 640
     height = 480
+    top_y = 224
 
-    top_y = 232
-
-    # RTL relationship:
-    #
+    # Relationship is unchanged:
     # message_left = 640 - scroll_pos
-    #
-    # Therefore:
-    #
-    # scroll_pos = 640 - desired_left_x
-
     scroll_position = 640 - left_x
 
-    dut.user_project.scroll_pos.value = (
-        scroll_position
+    set_controls(
+        dut,
+        speed=0,
+        pause=True,
+        text_color=text_color,
+        bg_color=bg_color,
     )
 
-    await Timer(
-        1,
-        unit="ns",
-    )
+    dut.user_project.scroll_pos.value = scroll_position
 
-    # Entire frame defaults to black.
-    pixels = [
-        (0, 0, 0)
-    ] * (
-        width * height
-    )
+    await Timer(1, unit="ns")
 
-    # Only the text region needs to be simulated pixel-by-pixel.
-    # Add 10-pixel margins around the message.
-    sample_x0 = max(
-        0,
-        left_x - 10,
-    )
+    text_rgb222 = TEXT_RGB222[text_color]
+    bg_rgb222 = BG_RGB222[bg_color]
 
+    text_rgb888 = rgb222_to_rgb888(text_rgb222)
+    bg_rgb888 = rgb222_to_rgb888(bg_rgb222)
+
+    # Full active frame is the selected background colour.
+    pixels = [bg_rgb888] * (width * height)
+
+    # Verify several ordinary background pixels first.
+    background_points = [
+        (20, 20),
+        (620, 20),
+        (20, 450),
+        (620, 450),
+    ]
+
+    for x, y in background_points:
+        dut.user_project.vga_inst.h_count.value = x
+        dut.user_project.vga_inst.v_count.value = y
+
+        await ReadOnly()
+
+        actual = decode_rgb222(int(dut.uo_out.value))
+
+        assert actual == bg_rgb222, (
+            f"Background colour mismatch at ({x},{y}): "
+            f"expected {bg_rgb222}, got {actual}"
+        )
+
+        await Timer(1, unit="ns")
+
+    sample_x0 = max(0, left_x - 8)
     sample_x1 = min(
         width - 1,
-        left_x
-        + (16 * len(message))
-        + 10,
+        left_x + 32 * len(message) + 8,
     )
 
-    sample_y0 = (
-        top_y - 4
-    )
-
-    sample_y1 = (
-        top_y + 19
-    )
+    sample_y0 = top_y - 4
+    sample_y1 = top_y + 35
 
     mismatches = []
-    lit_pixels = []
+    text_pixels = []
 
-    dut._log.info(
-        "Rendering %s with message left edge at x=%d "
-        "(scroll_pos=%d)",
-        image_path,
-        left_x,
-        scroll_position,
-    )
-
-    for y in range(
-        sample_y0,
-        sample_y1 + 1,
-    ):
-
-        for x in range(
-            sample_x0,
-            sample_x1 + 1,
-        ):
-
-            # Directly select a VGA coordinate.
+    for y in range(sample_y0, sample_y1 + 1):
+        for x in range(sample_x0, sample_x1 + 1):
             dut.user_project.vga_inst.h_count.value = x
             dut.user_project.vga_inst.v_count.value = y
 
-            # Let all continuous/combinational RTL settle.
             await ReadOnly()
 
-            uo_value = int(
-                dut.uo_out.value
+            actual_rgb222 = decode_rgb222(
+                int(dut.uo_out.value)
             )
 
-            rgb = decode_rgb222(
-                uo_value
-            )
-
-            pixels[
-                y * width + x
-            ] = rgb
-
-            actual_on = (
-                rgb != (0, 0, 0)
-            )
-
-            expected_on = expected_text_pixel(
+            expected_on = expected_text_on(
                 message,
                 x,
                 y,
@@ -599,32 +447,31 @@ async def render_and_verify_frame(
                 top_y=top_y,
             )
 
-            if actual_on:
+            expected_rgb222 = (
+                text_rgb222
+                if expected_on
+                else bg_rgb222
+            )
 
-                lit_pixels.append(
-                    (x, y)
-                )
+            pixels[y * width + x] = rgb222_to_rgb888(
+                actual_rgb222
+            )
 
-            if actual_on != expected_on:
+            if expected_on:
+                text_pixels.append((x, y))
 
+            if actual_rgb222 != expected_rgb222:
                 mismatches.append(
                     (
                         x,
                         y,
-                        expected_on,
-                        actual_on,
-                        uo_value,
+                        expected_rgb222,
+                        actual_rgb222,
                     )
                 )
 
-            # ReadOnly ends the current simulator time step.
-            # Move to a new time step before driving coordinates again.
-            await Timer(
-                1,
-                unit="ns",
-            )
+            await Timer(1, unit="ns")
 
-    # Always save image before assertions so debugging is easier.
     write_png(
         image_path,
         width,
@@ -632,125 +479,37 @@ async def render_and_verify_frame(
         pixels,
     )
 
-    dut._log.info(
-        "Saved VGA frame: %s",
-        image_path,
-    )
-
-    assert len(lit_pixels) > 200, (
-        f"Too few illuminated text pixels "
-        f"in {image_path}"
-    )
-
-    min_x = min(
-        x for x, _ in lit_pixels
-    )
-
-    max_x = max(
-        x for x, _ in lit_pixels
-    )
-
-    min_y = min(
-        y for _, y in lit_pixels
-    )
-
-    max_y = max(
-        y for _, y in lit_pixels
-    )
-
-    dut._log.info(
-        "%s bounding box: x=%d..%d, y=%d..%d",
-        image_path,
-        min_x,
-        max_x,
-        min_y,
-        max_y,
-    )
-
-    # First glyph can begin a few pixels after cell left edge because
-    # the 5x7 font has horizontal margin.
-    assert (
-        left_x
-        <= min_x
-        <= left_x + 11
-    ), (
-        f"Unexpected text left edge in "
-        f"{image_path}: {min_x}"
-    )
-
-    assert max_x < (
-        left_x
-        + 16 * len(message)
-    ), (
-        f"Text extends beyond message width "
-        f"in {image_path}: {max_x}"
-    )
-
-    assert (
-        top_y
-        <= min_y
-        <= top_y + 13
-    ), (
-        f"Unexpected text top edge in "
-        f"{image_path}: {min_y}"
-    )
-
-    assert max_y <= (
-        top_y + 13
-    ), (
-        f"Text extends below 5x7 scaled font "
-        f"in {image_path}: {max_y}"
+    assert len(text_pixels) > 800, (
+        f"Too few expected 4x text pixels in {image_path}"
     )
 
     if mismatches:
-
         preview = "\n".join(
-
             (
                 f"x={x}, y={y}, "
-                f"expected={'ON' if expected else 'OFF'}, "
-                f"actual={'ON' if actual else 'OFF'}, "
-                f"uo_out=0x{uo:02X}"
+                f"expected={expected}, actual={actual}"
             )
-
-            for (
-                x,
-                y,
-                expected,
-                actual,
-                uo,
-            ) in mismatches[:20]
-
+            for x, y, expected, actual
+            in mismatches[:20]
         )
 
         raise AssertionError(
-
-            f"{len(mismatches)} VGA pixel mismatch(es) "
-            f"in {image_path}.\n"
-            f"First mismatches:\n"
-            f"{preview}"
-
+            f"{len(mismatches)} pixel mismatch(es) "
+            f"in {image_path}\n{preview}"
         )
 
-    return (
-        min_x,
-        max_x,
-        min_y,
-        max_y,
+    dut._log.info(
+        "Verified and saved %s",
+        image_path,
     )
 
 
 # ============================================================================
-# MAIN COCOTB TEST
+# MAIN TEST
 # ============================================================================
 
 @cocotb.test()
-async def test_uart_vga_scroller(dut):
-
-    # ------------------------------------------------------------------------
-    # Start 25.175-MHz-equivalent clock.
-    # ------------------------------------------------------------------------
-
+async def test_uart_vga_scroller_4x_colour(dut):
     clock = Clock(
         dut.clk,
         CLK_PERIOD_PS,
@@ -759,357 +518,164 @@ async def test_uart_vga_scroller(dut):
 
     clock.start()
 
-
-    # ========================================================================
-    # 1. RESET / UNUSED UIO TEST
-    # ========================================================================
-
+    # ------------------------------------------------------------------------
+    # Reset and unused UIO
+    # ------------------------------------------------------------------------
     await reset_dut(dut)
 
-    assert int(
-        dut.uio_out.value
-    ) == 0, (
-        "Unused uio_out pins should be 0"
-    )
+    assert int(dut.uio_out.value) == 0
+    assert int(dut.uio_oe.value) == 0
 
-    assert int(
-        dut.uio_oe.value
-    ) == 0, (
-        "All UIO pins should be configured as inputs"
-    )
-
-
-    # ========================================================================
-    # 2. BASIC VGA HSYNC TEST
-    #
-    # This portion uses only external pins and therefore also works during
-    # gate-level simulation.
-    # ========================================================================
-
-    # h_count is 2 after reset_dut().
-    #
-    # Advance:
-    #     x = 2
-    # to:
-    #     x = 656
-
-    await ClockCycles(
-        dut.clk,
-        654,
-    )
-
-    # Allow gate-level combinational propagation to settle.
-    await Timer(
-        10,
-        unit="ns",
-    )
+    # ------------------------------------------------------------------------
+    # External HSYNC timing check. This remains gate-level compatible.
+    # ------------------------------------------------------------------------
+    await ClockCycles(dut.clk, 654)
+    await Timer(10, unit="ns")
 
     assert (
-        (
-            int(dut.uo_out.value)
-            >> 7
-        )
-        & 1
-    ) == 0, (
-        "HSYNC should be low at x=656"
-    )
+        (int(dut.uo_out.value) >> 7) & 1
+    ) == 0, "HSYNC should be low at x=656"
 
-
-    # HSYNC low period:
-    #
-    # 656 through 751
-    #
-    # = 96 pixel clocks
-
-    await ClockCycles(
-        dut.clk,
-        96,
-    )
-
-    await Timer(
-        10,
-        unit="ns",
-    )
+    await ClockCycles(dut.clk, 96)
+    await Timer(10, unit="ns")
 
     assert (
-        (
-            int(dut.uo_out.value)
-            >> 7
-        )
-        & 1
-    ) == 1, (
-        "HSYNC should return high at x=752"
-    )
+        (int(dut.uo_out.value) >> 7) & 1
+    ) == 1, "HSYNC should return high at x=752"
 
-
-    # ========================================================================
-    # GATE-LEVEL TEST ENDS HERE
-    #
-    # Internal RTL names/registers are not guaranteed to survive synthesis,
-    # so all remaining checks are RTL-only.
-    # ========================================================================
-
-    if os.getenv(
-        "GATES",
-        "no",
-    ) == "yes":
-
+    if os.getenv("GATES", "no") == "yes":
         dut._log.info(
             "Gate-level external VGA timing test passed."
         )
-
         return
 
-
-    # ========================================================================
-    # 3. SEND "HELLO MITS" THROUGH REAL UART INPUT
-    # ========================================================================
-
+    # ------------------------------------------------------------------------
+    # UART message
+    # ------------------------------------------------------------------------
     await reset_dut(dut)
 
-    message = "HELLO MITS"
-
-    dut._log.info(
-        'Sending "%s" through UART RX...',
-        message,
-    )
+    # Exactly 32 supported characters.
+    message = "HELLO MITS HELLO MITS HELLO MITS"
+    assert len(message) == 32
 
     await uart_send_message(
         dut,
         message,
     )
 
-    await ClockCycles(
-        dut.clk,
-        8,
-    )
-
-
-    # ========================================================================
-    # 4. VERIFY MESSAGE BUFFER STATE
-    # ========================================================================
+    await ClockCycles(dut.clk, 8)
 
     assert int(
         dut.user_project.msg_len.value
-    ) == len(message), (
-        f"Expected msg_len={len(message)}"
-    )
+    ) == len(message)
 
     assert int(
         dut.user_project.write_ptr.value
-    ) == 0, (
-        "Enter should reset write_ptr to 0"
-    )
+    ) == 0
 
     assert int(
         dut.user_project.scroll_pos.value
-    ) == 0, (
-        "Enter should restart scroll_pos at 0"
-    )
+    ) == 0
 
-
-    # ========================================================================
-    # 5. VERIFY SCROLL SPEED
-    #
-    # ui[1:0] = 01
-    #
-    # Expected:
-    #     2 pixels/frame
-    # ========================================================================
-
+    # ------------------------------------------------------------------------
+    # Scroll speed is preserved.
+    # ------------------------------------------------------------------------
     set_controls(
         dut,
         speed=1,
         pause=False,
+        text_color=0,
+        bg_color=0,
     )
 
-    # Force VGA timing to the final pixel of a frame.
     dut.user_project.vga_inst.h_count.value = 799
     dut.user_project.vga_inst.v_count.value = 524
 
-    await Timer(
-        1,
-        unit="ns",
-    )
-
-    await RisingEdge(
-        dut.clk
-    )
-
+    await Timer(1, unit="ns")
+    await RisingEdge(dut.clk)
     await ReadOnly()
 
     assert int(
         dut.user_project.scroll_pos.value
-    ) == 2, (
-        "Speed 01 should move by 2 pixels/frame"
-    )
+    ) == 2
 
-    await Timer(
-        1,
-        unit="ns",
-    )
+    await Timer(1, unit="ns")
 
-
-    # ========================================================================
-    # 6. VERIFY PAUSE
-    # ========================================================================
-
+    # ------------------------------------------------------------------------
+    # Pause is preserved.
+    # ------------------------------------------------------------------------
     set_controls(
         dut,
         speed=3,
         pause=True,
+        text_color=0,
+        bg_color=0,
     )
 
     dut.user_project.vga_inst.h_count.value = 799
     dut.user_project.vga_inst.v_count.value = 524
 
-    await Timer(
-        1,
-        unit="ns",
-    )
-
-    await RisingEdge(
-        dut.clk
-    )
-
+    await Timer(1, unit="ns")
+    await RisingEdge(dut.clk)
     await ReadOnly()
 
     assert int(
         dut.user_project.scroll_pos.value
-    ) == 2, (
-        "Pause should hold scroll_pos"
-    )
+    ) == 2
 
-    await Timer(
-        1,
-        unit="ns",
-    )
+    await Timer(1, unit="ns")
 
-
-    # ========================================================================
-    # 7. STOP CLOCK BEFORE MANUAL VGA PIXEL SAMPLING
-    # ========================================================================
-
+    # ------------------------------------------------------------------------
+    # Stop clock for deterministic manual VGA-coordinate sampling.
+    # ------------------------------------------------------------------------
     clock.stop()
 
-    set_controls(
-        dut,
-        speed=0,
-        pause=True,
-    )
-
-    await Timer(
-        1,
-        unit="ns",
-    )
-
-
-    # ========================================================================
-    # 8. CREATE OUTPUT DIRECTORY
-    # ========================================================================
-
-    output_dir = Path(
-        "output"
-    )
-
+    output_dir = Path("output")
     output_dir.mkdir(
         parents=True,
         exist_ok=True,
     )
 
-
-    # ========================================================================
-    # 9. FRAME 1
+    # ------------------------------------------------------------------------
+    # Frame 1: beginning of the 32-character message.
+    # White text on black background.
     #
-    # Message left edge:
-    #
-    #     x = 200
-    #
-    # Equivalent:
-    #
-    #     scroll_pos = 640 - 200 = 440
-    # ========================================================================
-
-    frame1_path = (
-        output_dir
-        / "vga_hello_mits_frame1.png"
-    )
-
-    frame1_box = await render_and_verify_frame(
+    # Total message width = 32 x 32 = 1024 pixels, so only part of the
+    # full message is visible on the 640-pixel display at one time.
+    # ------------------------------------------------------------------------
+    await capture_frame(
         dut,
         message,
         left_x=200,
-        image_path=frame1_path,
+        text_color=0,
+        bg_color=0,
+        image_path=(
+            output_dir
+            / "vga_32char_white_black_start.png"
+        ),
     )
 
-
-    # ========================================================================
-    # 10. FRAME 2
+    # ------------------------------------------------------------------------
+    # Frame 2: later scroll position so the end of the 32-character
+    # message is visible.  The left edge is off-screen by 384 pixels:
     #
-    # Message shifted 80 pixels to the left:
+    #   -384 + 1024 = 640
     #
-    #     x = 120
-    #
-    # Equivalent:
-    #
-    #     scroll_pos = 640 - 120 = 520
-    # ========================================================================
-
-    frame2_path = (
-        output_dir
-        / "vga_hello_mits_frame2.png"
-    )
-
-    frame2_box = await render_and_verify_frame(
+    # Yellow text on dark-blue background.
+    # ------------------------------------------------------------------------
+    await capture_frame(
         dut,
         message,
-        left_x=120,
-        image_path=frame2_path,
-    )
-
-
-    # ========================================================================
-    # 11. VERIFY THE SECOND FRAME REALLY MOVED LEFT
-    # ========================================================================
-
-    frame1_min_x = frame1_box[0]
-    frame2_min_x = frame2_box[0]
-
-    measured_shift = (
-        frame1_min_x
-        - frame2_min_x
-    )
-
-    assert measured_shift == 80, (
-        f"Expected second frame to shift left by 80 pixels, "
-        f"but measured {measured_shift}"
-    )
-
-
-    # ========================================================================
-    # FINAL PASS MESSAGES
-    # ========================================================================
-
-    dut._log.info(
-        'PASS: UART "%s" was received correctly.',
-        message,
+        left_x=-384,
+        text_color=1,
+        bg_color=1,
+        image_path=(
+            output_dir
+            / "vga_32char_yellow_blue_end.png"
+        ),
     )
 
     dut._log.info(
-        "PASS: Scroll speed and pause controls verified."
-    )
-
-    dut._log.info(
-        "PASS: Frame 1 verified: %s",
-        frame1_path,
-    )
-
-    dut._log.info(
-        "PASS: Frame 2 verified: %s",
-        frame2_path,
-    )
-
-    dut._log.info(
-        "PASS: Second frame moved left by exactly %d pixels.",
-        measured_shift,
+        "PASS: exact 32-character UART buffer, 4x scaling, scrolling, "
+        "pause, text colour and background colour verified."
     )
