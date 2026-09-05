@@ -6,8 +6,8 @@
  * UART RX  : ui_in[3]
  * VGA      : uo_out[7:0], TinyVGA RGB222 + HSYNC/VSYNC
  *
- * Message length : 16 characters maximum
- * Font           : 5x7, scaled 2x
+ * Message length : 32 characters maximum
+ * Font           : 5x7, scaled 4x
  */
 
 `default_nettype none
@@ -80,13 +80,14 @@ module tt_um_nobleg30_uart_vga_scroller (
     // 40       ?
     // 41       :
     //
-    // Storage = 16 x 6 = 96 bits
+    // Storage = 32 x 6 = 192 bits
     // ============================================================
 
-    reg [5:0] msg_mem [0:15];
+    reg [5:0] msg_mem [0:31];
 
-    reg [4:0] msg_len;
-    reg [4:0] write_ptr;
+    // 6 bits are required because msg_len/write_ptr must represent 32.
+    reg [5:0] msg_len;
+    reg [5:0] write_ptr;
 
     integer i;
 
@@ -101,24 +102,12 @@ module tt_um_nobleg30_uart_vga_scroller (
 
         begin
 
-            // A-Z
-            //
-            // ASCII:
-            // A = 0x41 -> lower 6 bits = 1
-            // Z = 0x5A -> lower 6 bits = 26
-
             if ((ascii >= 8'h41) &&
                 (ascii <= 8'h5A)) begin
 
                 ascii_to_code = ascii[5:0];
 
             end
-
-
-            // a-z -> A-Z
-            //
-            // 'a'[5:0] = 33
-            // 33 - 32 = 1
 
             else if ((ascii >= 8'h61) &&
                      (ascii <= 8'h7A)) begin
@@ -128,12 +117,6 @@ module tt_um_nobleg30_uart_vga_scroller (
 
             end
 
-
-            // 0-9
-            //
-            // '0' = 48
-            // 48 - 21 = 27
-
             else if ((ascii >= 8'h30) &&
                      (ascii <= 8'h39)) begin
 
@@ -141,7 +124,6 @@ module tt_um_nobleg30_uart_vga_scroller (
                     ascii[5:0] - 6'd21;
 
             end
-
 
             else begin
 
@@ -179,22 +161,16 @@ module tt_um_nobleg30_uart_vga_scroller (
 
     // ------------------------------------------------------------
     // Store incoming UART characters
-    //
-    // CR/LF:
-    //   - resets write pointer
-    //   - restarts scrolling
-    //
-    // Next character therefore starts a new message.
     // ------------------------------------------------------------
 
     always @(posedge clk) begin
 
         if (!rst_n) begin
 
-            msg_len   <= 5'd0;
-            write_ptr <= 5'd0;
+            msg_len   <= 6'd0;
+            write_ptr <= 6'd0;
 
-            for (i = 0; i < 16; i = i + 1)
+            for (i = 0; i < 32; i = i + 1)
                 msg_mem[i] <= 6'd0;
 
         end
@@ -203,31 +179,26 @@ module tt_um_nobleg30_uart_vga_scroller (
 
             if (rx_valid) begin
 
-                // ENTER = carriage return or line feed
-
                 if ((rx_data == 8'h0D) ||
                     (rx_data == 8'h0A)) begin
 
-                    write_ptr <= 5'd0;
+                    write_ptr <= 6'd0;
 
                 end
-
-
-                // Printable ASCII
 
                 else if ((rx_data >= 8'h20) &&
                          (rx_data <= 8'h7E)) begin
 
-                    if (write_ptr < 5'd16) begin
+                    if (write_ptr < 6'd32) begin
 
-                        msg_mem[write_ptr[3:0]]
+                        msg_mem[write_ptr[4:0]]
                             <= ascii_to_code(rx_data);
 
                         msg_len
-                            <= write_ptr + 5'd1;
+                            <= write_ptr + 6'd1;
 
                         write_ptr
-                            <= write_ptr + 5'd1;
+                            <= write_ptr + 6'd1;
 
                     end
 
@@ -243,35 +214,41 @@ module tt_um_nobleg30_uart_vga_scroller (
     // ============================================================
     // SCROLL CONTROL
     //
-    // ui_in[1:0]
+    // 4x font scaling uses a 32-pixel-wide character cell.
+    // Maximum message width = 32 x 32 = 1024 pixels.
     //
-    // 00 = 1 pixel/frame
-    // 01 = 2 pixels/frame
-    // 10 = 4 pixels/frame
-    // 11 = 8 pixels/frame
+    // The full scroll distance is therefore:
     //
-    // ui_in[2] = pause
+    //     640 + message_width
+    //
+    // which can reach 1664 pixels.
+    //
+    // scroll_pos and scroll_limit still fit in 11 bits, but
+    // h_count + scroll_pos can reach 2462, so x_sum/rel_x
+    // are widened to 12 bits.
     // ============================================================
 
-    reg [9:0] scroll_pos;
+    reg [10:0] scroll_pos;
 
-    wire [8:0] msg_width;
-    wire [9:0] scroll_limit;
-    wire [9:0] scroll_step;
+    wire [10:0] msg_width;
+    wire [10:0] scroll_limit;
+    wire [10:0] scroll_step;
 
     wire rx_enter;
 
 
+    // 32 pixels per character:
+    // msg_width = msg_len << 5
     assign msg_width =
-        {msg_len, 4'b0000};
+        {msg_len, 5'b00000};
 
 
     assign scroll_limit =
-        10'd640 + {1'b0, msg_width};
+        11'd640 + msg_width;
 
 
     assign scroll_step =
-        10'd1 << ui_in[1:0];
+        11'd1 << ui_in[1:0];
 
 
     assign rx_enter =
@@ -286,22 +263,20 @@ module tt_um_nobleg30_uart_vga_scroller (
 
         if (!rst_n) begin
 
-            scroll_pos <= 10'd0;
+            scroll_pos <= 11'd0;
 
         end
-
 
         else if (rx_enter) begin
 
-            scroll_pos <= 10'd0;
+            scroll_pos <= 11'd0;
 
         end
-
 
         else if (
             frame_tick &&
             !ui_in[2] &&
-            (msg_len != 5'd0)
+            (msg_len != 6'd0)
         ) begin
 
             if (
@@ -309,7 +284,7 @@ module tt_um_nobleg30_uart_vga_scroller (
                 >= scroll_limit
             ) begin
 
-                scroll_pos <= 10'd0;
+                scroll_pos <= 11'd0;
 
             end
 
@@ -328,22 +303,19 @@ module tt_um_nobleg30_uart_vga_scroller (
     // ============================================================
     // TEXT POSITION CALCULATION
     //
-    // Message starts outside right side:
+    // Character cell : 32 x 32 pixels
+    // Font           : 5 x 7
+    // Scale          : 4 x
     //
-    // message_x = 640 - scroll_pos
+    // Visible glyph  : 20 x 28 pixels
     //
-    // Therefore:
-    //
-    // rel_x = pixel_x + scroll_pos - 640
-    //
-    // Character cell = 16 x 16 pixels
-    // Font = 5 x 7 scaled 2x
+    // The 32x32 cell leaves margins around the scaled glyph.
     // ============================================================
 
-    wire [10:0] x_sum;
-    wire [10:0] rel_x;
+    wire [11:0] x_sum;
+    wire [11:0] rel_x;
 
-    wire [3:0] char_index;
+    wire [4:0] char_index;
 
     wire [2:0] glyph_col;
     wire [2:0] glyph_row;
@@ -355,53 +327,30 @@ module tt_um_nobleg30_uart_vga_scroller (
 
 
     assign x_sum =
-        {1'b0, h_count}
+        {2'b00, h_count}
         +
         {1'b0, scroll_pos};
 
 
     assign rel_x =
-        x_sum - 11'd640;
+        x_sum - 12'd640;
 
 
-    // 16 pixels per character
-
+    // 32 pixels per character -> divide by 32.
+    // Five index bits select one of 32 message entries.
     assign char_index =
-        rel_x[7:4];
+        rel_x[9:5];
 
 
-    // 2x horizontal font scaling
-
+    // 4x horizontal scaling -> divide cell x coordinate by 4.
     assign glyph_col =
-        rel_x[3:1];
+        rel_x[4:2];
 
 
-    // ------------------------------------------------------------
-    // Vertical font row
-    //
-    // Text window = y 232 to 247
-    //
-    // Desired sequence:
-    //
-    // y=232,233 -> row 0
-    // y=234,235 -> row 1
-    // ...
-    // y=244,245 -> row 6
-    // y=246,247 -> row 7 (blank)
-    //
-    // v_count[3:1] sequence inside this region is:
-    //
-    // 4,4,5,5,6,6,7,7,0,0,1,1,2,2,3,3
-    //
-    // Adding 4 modulo 8 gives:
-    //
-    // 0,0,1,1,2,2,3,3,4,4,5,5,6,6,7,7
-    //
-    // This removes the unused rel_y signal.
-    // ------------------------------------------------------------
-
+    // Text window begins at y=224, which is aligned to 32 pixels.
+    // v_count[4:2] therefore directly gives rows 0..7.
     assign glyph_row =
-        v_count[3:1] + 3'd4;
+        v_count[4:2];
 
 
     assign current_code =
@@ -457,6 +406,11 @@ module tt_um_nobleg30_uart_vga_scroller (
 
     // ============================================================
     // TEXT DISPLAY WINDOW
+    //
+    // 32-pixel-high cell centered vertically around the same
+    // region used by the previous 2x version.
+    //
+    // y = 224 ... 255
     // ============================================================
 
     wire text_window;
@@ -467,17 +421,13 @@ module tt_um_nobleg30_uart_vga_scroller (
 
         video_active &&
 
-        // Vertical text position
-        (v_count >= 10'd232) &&
-        (v_count <  10'd248) &&
+        (v_count >= 10'd224) &&
+        (v_count <  10'd256) &&
 
-        // Message has entered visible region
-        (x_sum >= 11'd640) &&
+        (x_sum >= 12'd640) &&
 
-        // Pixel lies inside current message width
-        (rel_x < {2'b00, msg_width}) &&
+        (rel_x < {1'b0, msg_width}) &&
 
-        // Character number is valid
         ({1'b0, char_index} < msg_len);
 
 
@@ -488,40 +438,105 @@ module tt_um_nobleg30_uart_vga_scroller (
 
 
     // ============================================================
-    // VGA COLOUR
+    // VGA COLOUR SELECTION
     //
-    // White text on black background
-    // RGB222
+    // ui_in[5:4] : text colour preset
+    //
+    //   00 = White
+    //   01 = Yellow
+    //   10 = Cyan
+    //   11 = Magenta
+    //
+    // ui_in[7:6] : background colour preset
+    //
+    //   00 = Black
+    //   01 = Dark blue
+    //   10 = Dark green
+    //   11 = Dark red
+    //
+    // RGB format below is:
+    //
+    //   { R[1:0], G[1:0], B[1:0] }
+    //
+    // During VGA blanking, RGB is forced to black.
     // ============================================================
+
+    reg [5:0] text_rgb;
+    reg [5:0] background_rgb;
+
+    wire [5:0] selected_rgb;
 
     wire [1:0] red;
     wire [1:0] green;
     wire [1:0] blue;
 
 
+    always @* begin
+
+        case (ui_in[5:4])
+
+            2'b00:
+                text_rgb = 6'b11_11_11;  // white
+
+            2'b01:
+                text_rgb = 6'b11_11_00;  // yellow
+
+            2'b10:
+                text_rgb = 6'b00_11_11;  // cyan
+
+            default:
+                text_rgb = 6'b11_00_11;  // magenta
+
+        endcase
+
+    end
+
+
+    always @* begin
+
+        case (ui_in[7:6])
+
+            2'b00:
+                background_rgb = 6'b00_00_00;  // black
+
+            2'b01:
+                background_rgb = 6'b00_00_01;  // dark blue
+
+            2'b10:
+                background_rgb = 6'b00_01_00;  // dark green
+
+            default:
+                background_rgb = 6'b01_00_00;  // dark red
+
+        endcase
+
+    end
+
+
+    assign selected_rgb =
+        !video_active
+        ? 6'b00_00_00
+        : (
+            pixel_on
+            ? text_rgb
+            : background_rgb
+        );
+
+
     assign red =
-        pixel_on ? 2'b11 : 2'b00;
+        selected_rgb[5:4];
 
 
     assign green =
-        pixel_on ? 2'b11 : 2'b00;
+        selected_rgb[3:2];
 
 
     assign blue =
-        pixel_on ? 2'b11 : 2'b00;
+        selected_rgb[1:0];
 
 
     // ============================================================
     // TinyVGA OUTPUT MAPPING
-    //
-    // uo[0] = R1
-    // uo[1] = G1
-    // uo[2] = B1
-    // uo[3] = VSYNC
-    // uo[4] = R0
-    // uo[5] = G0
-    // uo[6] = B0
-    // uo[7] = HSYNC
     // ============================================================
 
     assign uo_out[0] = red[1];
@@ -539,8 +554,6 @@ module tt_um_nobleg30_uart_vga_scroller (
 
     // ============================================================
     // BIDIRECTIONAL PINS
-    //
-    // Not used in this design.
     // ============================================================
 
     assign uio_out =
@@ -550,13 +563,10 @@ module tt_um_nobleg30_uart_vga_scroller (
         8'b00000000;
 
 
-    // Suppress unused-input warnings for unused UI/UIO pins.
-
     wire _unused;
 
     assign _unused =
         &{
-            ui_in[7:4],
             uio_in,
             1'b0
         };
@@ -608,9 +618,6 @@ module tt_um_nobleg30_uart_vga_scroller (
 
     // ============================================================
     // 5 x 7 FONT
-    //
-    // Each glyph = 35 bits
-    // 7 rows x 5 columns
     // ============================================================
 
     function [34:0] glyph35;
@@ -621,299 +628,173 @@ module tt_um_nobleg30_uart_vga_scroller (
 
             case (code)
 
-                // SPACE
-
                 6'd0:
                     glyph35 =
                     35'b00000_00000_00000_00000_00000_00000_00000;
-
-
-                // A
 
                 6'd1:
                     glyph35 =
                     35'b01110_10001_10001_11111_10001_10001_10001;
 
-
-                // B
-
                 6'd2:
                     glyph35 =
                     35'b11110_10001_10001_11110_10001_10001_11110;
-
-
-                // C
 
                 6'd3:
                     glyph35 =
                     35'b01111_10000_10000_10000_10000_10000_01111;
 
-
-                // D
-
                 6'd4:
                     glyph35 =
                     35'b11110_10001_10001_10001_10001_10001_11110;
-
-
-                // E
 
                 6'd5:
                     glyph35 =
                     35'b11111_10000_10000_11110_10000_10000_11111;
 
-
-                // F
-
                 6'd6:
                     glyph35 =
                     35'b11111_10000_10000_11110_10000_10000_10000;
-
-
-                // G
 
                 6'd7:
                     glyph35 =
                     35'b01111_10000_10000_10111_10001_10001_01111;
 
-
-                // H
-
                 6'd8:
                     glyph35 =
                     35'b10001_10001_10001_11111_10001_10001_10001;
-
-
-                // I
 
                 6'd9:
                     glyph35 =
                     35'b11111_00100_00100_00100_00100_00100_11111;
 
-
-                // J
-
                 6'd10:
                     glyph35 =
                     35'b00111_00010_00010_00010_00010_10010_01100;
-
-
-                // K
 
                 6'd11:
                     glyph35 =
                     35'b10001_10010_10100_11000_10100_10010_10001;
 
-
-                // L
-
                 6'd12:
                     glyph35 =
                     35'b10000_10000_10000_10000_10000_10000_11111;
-
-
-                // M
 
                 6'd13:
                     glyph35 =
                     35'b10001_11011_10101_10101_10001_10001_10001;
 
-
-                // N
-
                 6'd14:
                     glyph35 =
                     35'b10001_11001_10101_10011_10001_10001_10001;
-
-
-                // O
 
                 6'd15:
                     glyph35 =
                     35'b01110_10001_10001_10001_10001_10001_01110;
 
-
-                // P
-
                 6'd16:
                     glyph35 =
                     35'b11110_10001_10001_11110_10000_10000_10000;
-
-
-                // Q
 
                 6'd17:
                     glyph35 =
                     35'b01110_10001_10001_10001_10101_10010_01101;
 
-
-                // R
-
                 6'd18:
                     glyph35 =
                     35'b11110_10001_10001_11110_10100_10010_10001;
-
-
-                // S
 
                 6'd19:
                     glyph35 =
                     35'b01111_10000_10000_01110_00001_00001_11110;
 
-
-                // T
-
                 6'd20:
                     glyph35 =
                     35'b11111_00100_00100_00100_00100_00100_00100;
-
-
-                // U
 
                 6'd21:
                     glyph35 =
                     35'b10001_10001_10001_10001_10001_10001_01110;
 
-
-                // V
-
                 6'd22:
                     glyph35 =
                     35'b10001_10001_10001_10001_10001_01010_00100;
-
-
-                // W
 
                 6'd23:
                     glyph35 =
                     35'b10001_10001_10001_10101_10101_10101_01010;
 
-
-                // X
-
                 6'd24:
                     glyph35 =
                     35'b10001_10001_01010_00100_01010_10001_10001;
-
-
-                // Y
 
                 6'd25:
                     glyph35 =
                     35'b10001_10001_01010_00100_00100_00100_00100;
 
-
-                // Z
-
                 6'd26:
                     glyph35 =
                     35'b11111_00001_00010_00100_01000_10000_11111;
-
-
-                // 0
 
                 6'd27:
                     glyph35 =
                     35'b01110_10001_10011_10101_11001_10001_01110;
 
-
-                // 1
-
                 6'd28:
                     glyph35 =
                     35'b00100_01100_00100_00100_00100_00100_01110;
-
-
-                // 2
 
                 6'd29:
                     glyph35 =
                     35'b01110_10001_00001_00010_00100_01000_11111;
 
-
-                // 3
-
                 6'd30:
                     glyph35 =
                     35'b11110_00001_00001_01110_00001_00001_11110;
-
-
-                // 4
 
                 6'd31:
                     glyph35 =
                     35'b00010_00110_01010_10010_11111_00010_00010;
 
-
-                // 5
-
                 6'd32:
                     glyph35 =
                     35'b11111_10000_10000_11110_00001_00001_11110;
-
-
-                // 6
 
                 6'd33:
                     glyph35 =
                     35'b01110_10000_10000_11110_10001_10001_01110;
 
-
-                // 7
-
                 6'd34:
                     glyph35 =
                     35'b11111_00001_00010_00100_01000_01000_01000;
-
-
-                // 8
 
                 6'd35:
                     glyph35 =
                     35'b01110_10001_10001_01110_10001_10001_01110;
 
-
-                // 9
-
                 6'd36:
                     glyph35 =
                     35'b01110_10001_10001_01111_00001_00001_01110;
-
-
-                // .
 
                 6'd37:
                     glyph35 =
                     35'b00000_00000_00000_00000_00000_00110_00110;
 
-
-                // -
-
                 6'd38:
                     glyph35 =
                     35'b00000_00000_00000_11111_00000_00000_00000;
-
-
-                // !
 
                 6'd39:
                     glyph35 =
                     35'b00100_00100_00100_00100_00100_00000_00100;
 
-
-                // ?
-
                 6'd40:
                     glyph35 =
                     35'b01110_10001_00001_00010_00100_00000_00100;
 
-
-                // :
-
                 6'd41:
                     glyph35 =
                     35'b00000_00100_00100_00000_00100_00100_00000;
-
 
                 default:
                     glyph35 =
@@ -932,16 +813,6 @@ endmodule
 
 // ============================================================================
 // UART RECEIVER
-//
-// 9600 baud
-// 8 data bits
-// No parity
-// 1 stop bit
-//
-// 25.175 MHz / 9600 = approximately 2622 clocks/bit
-//
-// Fixed constants are intentionally width-matched to clk_count to avoid
-// Width-matched constants avoid width-expansion lint warnings
 // ============================================================================
 
 module uart_rx (
@@ -955,8 +826,6 @@ module uart_rx (
 
 );
 
-
-    // 2622 < 4096, so a 12-bit counter is sufficient.
 
     localparam [11:0] CLKS_PER_BIT =
         12'd2622;
@@ -990,13 +859,6 @@ module uart_rx (
     reg [7:0] rx_shift;
 
 
-    // ------------------------------------------------------------
-    // UART outputs
-    //
-    // rx_shift already contains the complete received byte when
-    // the stop bit is checked.
-    // ------------------------------------------------------------
-
     assign data_out =
         rx_shift;
 
@@ -1012,10 +874,6 @@ module uart_rx (
 
         rx_sync;
 
-
-    // ------------------------------------------------------------
-    // Two-flop synchronizer
-    // ------------------------------------------------------------
 
     always @(posedge clk) begin
 
@@ -1036,10 +894,6 @@ module uart_rx (
     end
 
 
-    // ------------------------------------------------------------
-    // UART state machine
-    // ------------------------------------------------------------
-
     always @(posedge clk) begin
 
         if (!rst_n) begin
@@ -1057,11 +911,6 @@ module uart_rx (
 
             case (state)
 
-
-                // =================================================
-                // IDLE
-                // =================================================
-
                 S_IDLE: begin
 
                     clk_count <= 12'd0;
@@ -1072,12 +921,6 @@ module uart_rx (
 
                 end
 
-
-                // =================================================
-                // START BIT
-                //
-                // Sample in middle of start bit.
-                // =================================================
 
                 S_START: begin
 
@@ -1104,12 +947,6 @@ module uart_rx (
 
                 end
 
-
-                // =================================================
-                // DATA BITS
-                //
-                // UART transmits LSB first.
-                // =================================================
 
                 S_DATA: begin
 
@@ -1149,10 +986,6 @@ module uart_rx (
 
                 end
 
-
-                // =================================================
-                // STOP BIT
-                // =================================================
 
                 S_STOP: begin
 
@@ -1195,29 +1028,6 @@ endmodule
 
 // ============================================================================
 // VGA TIMING GENERATOR
-//
-// Resolution: 640 x 480
-//
-// Horizontal:
-//
-// Visible      640
-// Front porch   16
-// Sync          96
-// Back porch    48
-// -----------------
-// Total        800
-//
-// Vertical:
-//
-// Visible      480
-// Front porch   10
-// Sync           2
-// Back porch    33
-// -----------------
-// Total        525
-//
-// Pixel clock approximately 25.175 MHz
-// Frame rate approximately 59.94 Hz
 // ============================================================================
 
 module vga_timing (
@@ -1236,10 +1046,6 @@ module vga_timing (
 
 );
 
-
-    // ------------------------------------------------------------
-    // Horizontal / vertical counters
-    // ------------------------------------------------------------
 
     always @(posedge clk) begin
 
@@ -1274,21 +1080,11 @@ module vga_timing (
     end
 
 
-    // ------------------------------------------------------------
-    // Visible display area
-    // ------------------------------------------------------------
-
     assign video_active =
 
         (h_count < 10'd640) &&
         (v_count < 10'd480);
 
-
-    // ------------------------------------------------------------
-    // Horizontal sync
-    //
-    // Active low from 656 to 751.
-    // ------------------------------------------------------------
 
     assign hsync = ~(
 
@@ -1298,12 +1094,6 @@ module vga_timing (
     );
 
 
-    // ------------------------------------------------------------
-    // Vertical sync
-    //
-    // Active low on lines 490 and 491.
-    // ------------------------------------------------------------
-
     assign vsync = ~(
 
         (v_count >= 10'd490) &&
@@ -1311,10 +1101,6 @@ module vga_timing (
 
     );
 
-
-    // ------------------------------------------------------------
-    // One pulse at end of every complete VGA frame
-    // ------------------------------------------------------------
 
     assign frame_tick =
 
