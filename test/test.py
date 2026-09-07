@@ -505,6 +505,81 @@ async def capture_frame(
 
 
 # ============================================================================
+# 2-BIT COMBINATIONAL ALU VERIFICATION
+# ============================================================================
+
+def expected_alu(a, b, sel):
+    if sel == 0:
+        return (a + b) & 0x3
+
+    if sel == 1:
+        return (a - b) & 0x3
+
+    if sel == 2:
+        return a & b
+
+    return a ^ b
+
+
+async def verify_all_alu_combinations(dut):
+    """
+    Exhaustively verify all 64 combinations:
+      4 A values x 4 B values x 4 functions.
+    """
+
+    assert int(dut.uio_oe.value) == 0xC0, (
+        "Expected uio_oe=0b11000000"
+    )
+
+    for sel in range(4):
+        for b in range(4):
+            for a in range(4):
+
+                dut.uio_in.value = (
+                    a
+                    | (b << 2)
+                    | (sel << 4)
+                )
+
+                await Timer(
+                    10,
+                    unit="ns",
+                )
+
+                actual_uio = int(
+                    dut.uio_out.value
+                )
+
+                assert (
+                    actual_uio & 0x3F
+                ) == 0, (
+                    f"uio_out[5:0] should remain 0, "
+                    f"got 0x{actual_uio:02X}"
+                )
+
+                actual_y = (
+                    actual_uio >> 6
+                ) & 0x3
+
+                expected_y = expected_alu(
+                    a,
+                    b,
+                    sel,
+                )
+
+                assert actual_y == expected_y, (
+                    f"ALU mismatch: "
+                    f"A={a:02b}, "
+                    f"B={b:02b}, "
+                    f"SEL={sel:02b}, "
+                    f"expected Y={expected_y:02b}, "
+                    f"got Y={actual_y:02b}"
+                )
+
+    dut.uio_in.value = 0
+
+
+# ============================================================================
 # MAIN TEST
 # ============================================================================
 
@@ -523,8 +598,12 @@ async def test_uart_vga_scroller_4x_colour(dut):
     # ------------------------------------------------------------------------
     await reset_dut(dut)
 
+    assert int(dut.uio_oe.value) == 0xC0
     assert int(dut.uio_out.value) == 0
-    assert int(dut.uio_oe.value) == 0
+
+    # Exhaustive ALU verification is placed before the GATES return,
+    # so it also runs in gate-level simulation.
+    await verify_all_alu_combinations(dut)
 
     # ------------------------------------------------------------------------
     # External HSYNC timing check. This remains gate-level compatible.
@@ -545,7 +624,7 @@ async def test_uart_vga_scroller_4x_colour(dut):
 
     if os.getenv("GATES", "no") == "yes":
         dut._log.info(
-            "Gate-level external VGA timing test passed."
+            "Gate-level VGA timing and 2-bit ALU tests passed."
         )
         return
 
@@ -676,6 +755,6 @@ async def test_uart_vga_scroller_4x_colour(dut):
     )
 
     dut._log.info(
-        "PASS: exact 32-character UART buffer, 4x scaling, scrolling, "
-        "pause, text colour and background colour verified."
+        "PASS: 32-character UART buffer, 4x VGA, colours, scrolling, "
+        "pause, and exhaustive 2-bit ALU verified."
     )
