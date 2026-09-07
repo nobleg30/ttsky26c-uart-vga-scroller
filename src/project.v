@@ -8,6 +8,18 @@
  *
  * Message length : 32 characters maximum
  * Font           : 5x7, scaled 4x
+ *
+ * Additional combinational block:
+ *   uio_in[1:0] = ALU A[1:0]
+ *   uio_in[3:2] = ALU B[1:0]
+ *   uio_in[5:4] = ALU SEL[1:0]
+ *   uio_out[7:6] = ALU Y[1:0]
+ *
+ * ALU functions:
+ *   SEL=00 : A + B   (2-bit modulo-4 result)
+ *   SEL=01 : A - B   (2-bit modulo-4 result)
+ *   SEL=10 : A AND B
+ *   SEL=11 : A XOR B
  */
 
 `default_nettype none
@@ -553,25 +565,85 @@ module tt_um_nobleg30_uart_vga_scroller (
 
 
     // ============================================================
-    // BIDIRECTIONAL PINS
+    // 2-BIT COMBINATIONAL ALU ON BIDIRECTIONAL PINS
+    //
+    // uio[0] : A[0]    input
+    // uio[1] : A[1]    input
+    // uio[2] : B[0]    input
+    // uio[3] : B[1]    input
+    // uio[4] : SEL[0]  input
+    // uio[5] : SEL[1]  input
+    // uio[6] : Y[0]    output
+    // uio[7] : Y[1]    output
+    //
+    // SEL:
+    //   00 : A + B
+    //   01 : A - B
+    //   10 : A AND B
+    //   11 : A XOR B
+    //
+    // Arithmetic results are limited to two bits, so ADD/SUB
+    // operate modulo 4.
     // ============================================================
 
+    wire [1:0] alu_a;
+    wire [1:0] alu_b;
+    wire [1:0] alu_sel;
+    reg  [1:0] alu_y;
+
+
+    assign alu_a =
+        uio_in[1:0];
+
+
+    assign alu_b =
+        uio_in[3:2];
+
+
+    assign alu_sel =
+        uio_in[5:4];
+
+
+    always @* begin
+
+        case (alu_sel)
+
+            2'b00:
+                alu_y = alu_a + alu_b;
+
+            2'b01:
+                alu_y = alu_a - alu_b;
+
+            2'b10:
+                alu_y = alu_a & alu_b;
+
+            default:
+                alu_y = alu_a ^ alu_b;
+
+        endcase
+
+    end
+
+
     assign uio_out =
-        8'b00000000;
-
-    assign uio_oe =
-        8'b00000000;
-
-
-    wire _unused;
-
-    assign _unused =
-        &{
-            uio_in,
-            1'b0
+        {
+            alu_y,
+            6'b000000
         };
 
 
+    // 0 = input, 1 = output.
+    // uio[5:0] inputs, uio[7:6] outputs.
+    assign uio_oe =
+        8'b11000000;
+
+    // uio_in[7:6] correspond to pins configured as ALU outputs.
+    // Their input-side values are intentionally unused.
+    wire _unused = &{
+        uio_in[7:6],
+        1'b0
+    };
+    
     // ============================================================
     // SELECT ONE ROW FROM 5x7 FONT
     // ============================================================
